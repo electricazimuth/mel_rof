@@ -106,9 +106,10 @@ class RotaryEmbeddingCompileSafeWrapper(nn.Module):
         original_cache = self.rope_instance.cache
 
         if should_cache and cache_key in original_cache:
-            # --- Critical Fix: Clone tensor retrieved from cache ---
-            freqs = original_cache[cache_key].clone()
-            return freqs
+            # Clone tensor retrieved from cache. The cached version should
+            # already be the final, repeated form based on original logic.
+            freqs_final = original_cache[cache_key].clone()
+            return freqs_final
 
         # --- Compute freqs if not cached ---
         if callable(t_lambda):
@@ -118,21 +119,23 @@ class RotaryEmbeddingCompileSafeWrapper(nn.Module):
 
         # Access freqs through the instance
         freqs_base = self.rope_instance.freqs
+        # Compute the base frequencies before repeating
+        freqs_computed = einsum('..., f -> ... f', t.type(freqs_base.dtype), freqs_base)
 
-        # Original computation logic
-        freqs = einsum('..., f -> ... f', t.type(freqs_base.dtype), freqs_base)
+        # --- CRITICAL FIX: Clone *before* repeat_interleave ---
+        # This ensures the tensor entering repeat_interleave is distinct
+        # within the context of the graph capture.
+        freqs_to_repeat = freqs_computed.clone()
 
-        # --- Critical Fix: Replace einops.repeat with torch native ---
-        # original: freqs = repeat(freqs, '... n -> ... (n r)', r = 2)
-        freqs = freqs.repeat_interleave(2, dim=-1)
+        # Apply repeat_interleave using the cloned tensor
+        freqs_final = freqs_to_repeat.repeat_interleave(2, dim=-1)
 
-        # --- Cache the computed freqs (in the original instance's cache) ---
+        # Cache the computed *and repeated* freqs
         if should_cache:
-            # Store a clone to be absolutely safe, although the primary
-            # issue is usually on retrieval.
-            original_cache[cache_key] = freqs.clone()
+            # Store a clone to be absolutely safe
+            original_cache[cache_key] = freqs_final.clone()
 
-        return freqs
+        return freqs_final
 
     def rotate_queries_or_keys(self, t, seq_dim = None, offset = 0, freq_seq_len = None):
         """
@@ -140,9 +143,7 @@ class RotaryEmbeddingCompileSafeWrapper(nn.Module):
         Mirrors the signature and basic logic of the original method.
         """
         seq_dim = default(seq_dim, self.default_seq_dim)
-
-        # Use the wrapper's use_xpos attribute
-        assert not self.use_xpos, 'you must use `.rotate_queries_and_keys` method instead and pass in both queries and keys, for length extrapolatable rotary embeddings'
+        assert not self.use_xpos, 'use .rotate_queries_and_keys for xpos'
 
         device, dtype, seq_len = t.device, t.dtype, t.shape[seq_dim]
 
@@ -155,7 +156,7 @@ class RotaryEmbeddingCompileSafeWrapper(nn.Module):
         # --- Use the safe frequency generation method ---
         freqs = self._get_safe_freqs(
             t_lambda=lambda: self.get_seq_pos(target_seq_len, device=device, dtype=dtype, offset=offset),
-            cache_key=f'freqs:{target_seq_len}|offset:{offset}' # Use same cache key format
+            cache_key=f'freqs:{target_seq_len}|offset:{offset}'
         )
         # --- End of safe frequency generation ---
 
@@ -167,7 +168,7 @@ class RotaryEmbeddingCompileSafeWrapper(nn.Module):
         # Note: We pass freqs[-seq_len:] to apply_rotary_emb implicitly inside it.
         # apply_rotary_emb handles selecting the correct slice based on t's seq_len.
         rotated_t = apply_rotary_emb(freqs, t, seq_dim = seq_dim)
-        rotated_t = rotated_t.type(t.dtype) # Ensure original dtype is preserved
+        rotated_t = rotated_t.type(t.dtype)
         return rotated_t
 
     # --- Add other methods if needed ---
