@@ -94,8 +94,34 @@ class RotaryEmbeddingCompileSafeWrapper(nn.Module):
         # Re-implementation is simple and avoids relying on internal method:
         return (torch.arange(seq_len, device=device, dtype=dtype) + offset) / self.interpolate_factor
 
+    # Inside RotaryEmbeddingCompileSafeWrapper class in safe_rotary.py
 
     def _get_safe_freqs(self, t_lambda, cache_key):
+        """
+        Internal method to compute frequencies safely for compilation.
+        Caching is completely disabled to avoid CUDA Graph conflicts.
+        """
+        # --- Caching Disabled ---
+        # Ignore cache_key and should_cache logic entirely
+
+        # --- Always Compute freqs ---
+        if callable(t_lambda):
+            t = t_lambda() # Execute the lambda to get the position tensor
+        else:
+            t = t_lambda # Assume t is already the position tensor
+
+        # Use the freqs stored in the rope_instance
+        freqs_base = self.rope_instance.freqs
+        # Compute the base frequencies before repeating
+        freqs_computed = einsum('..., f -> ... f', t.type(freqs_base.dtype), freqs_base)
+
+        # Apply repeat_interleave
+        freqs_final = freqs_computed.repeat_interleave(2, dim=-1)
+
+        # Return the computed freqs (optionally clone for extra safety, though likely not needed now)
+        return freqs_final # .clone() # Consider adding .clone() if errors persist even without cache
+
+    def _get_safe_freqsPREVIOUS(self, t_lambda, cache_key):
         """
         Internal method to compute or retrieve frequencies safely for compilation.
         Replicates the logic of the original `forward` method but adds cloning.
