@@ -44,8 +44,9 @@ class Attend(nn.Module):
 from beartype.typing import Tuple, Optional, List, Callable
 from beartype import beartype
 
-from rotary_embedding_torch import RotaryEmbedding
-
+#from rotary_embedding_torch import RotaryEmbedding
+# Import the wrapper instead
+from .safe_rotary import RotaryEmbeddingCompileSafeWrapper
 # Keep pack/unpack as they often work, remove others unless used elsewhere
 from einops import pack, unpack #, reduce, repeat # remove reduce/repeat if not used
 
@@ -397,8 +398,11 @@ class MelBandRoformer(Module):
             flash_attn=flash_attn
         )
 
-        time_rotary_embed = RotaryEmbedding(dim=dim_head)
-        freq_rotary_embed = RotaryEmbedding(dim=dim_head)
+        #time_rotary_embed = RotaryEmbedding(dim=dim_head)
+        #freq_rotary_embed = RotaryEmbedding(dim=dim_head)
+        time_rotary_embed = RotaryEmbeddingCompileSafeWrapper(dim=dim_head)
+        freq_rotary_embed = RotaryEmbeddingCompileSafeWrapper(dim=dim_head)
+
 
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
