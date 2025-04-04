@@ -95,7 +95,7 @@ def demix_track(config, model, mix, device, first_chunk_time=None):
     # Timing setup
     first_chunk_processed_flag = (first_chunk_time is not None) # Flag to track if first chunk timing is done
 
-    with torch.cuda.amp.autocast(): # Use autocast if desired/configured
+    with torch.cuda.amp.autocast(dtype=torch.float16): # Use autocast if desired/configured
         with torch.no_grad():
             while i < padded_total_length:
                 # --- Prepare Chunk ---

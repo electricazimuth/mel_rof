@@ -110,6 +110,7 @@ def proc_folder(args):
         if type(device_ids)==int:
             device = torch.device(f'cuda:{device_ids}')
             model = model.to(device)
+            print(f"Using device {device}")
         else:
             device = torch.device(f'cuda:{device_ids[0]}')
             model = nn.DataParallel(model, device_ids=device_ids).to(device)
@@ -117,6 +118,16 @@ def proc_folder(args):
         device = 'cpu'
         print('CUDA is not available. Run inference on CPU. It will be very slow...')
         model = model.to(device)
+
+    # no compile on P6000! - broken with dynamo / triton support
+    ##try:
+    ### Options: 'default', 'reduce-overhead', 'max-autotune'
+    ### 'reduce-overhead' is good for small inputs/models or significant Python overhead
+    ### 'max-autotune' takes longer to compile but might yield best results for long-running tasks
+    ##    model = torch.compile(model, mode='max-autotune') 
+    ##    print("Model compiled successfully.")
+    ##except Exception as e:
+    ##    print(f"torch.compile failed: {e}. Running without compilation.")
 
     run_folder(model, args, config, device, verbose=False)
 
