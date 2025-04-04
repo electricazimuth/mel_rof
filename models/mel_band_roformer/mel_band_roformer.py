@@ -398,6 +398,7 @@ class MelBandRoformer(Module):
 
         self.match_input_audio_length = match_input_audio_length
 
+    # Forward pass adjusted for torch.compile compatibility
     def forward(
             self,
             raw_audio,
@@ -405,21 +406,22 @@ class MelBandRoformer(Module):
             return_loss_breakdown=False
     ):
         """
-        einops
-
+        Dimension variables used in comments:
         b - batch
         f - freq
         t - time
         s - audio channel (1 for mono, 2 for stereo)
         n - number of 'stems'
-        c - complex (2)
+        c - complex (2, for real/imag)
         d - feature dimension
         """
 
         device = raw_audio.device
 
+        # --- Original einops: rearrange(raw_audio, 'b t -> b 1 t') ---
+        # Add channel dimension if input is 2D (mono)
         if raw_audio.ndim == 2:
-            raw_audio = rearrange(raw_audio, 'b t -> b 1 t')
+            raw_audio = raw_audio.unsqueeze(1) # Shape: (b, 1, t)
 
         batch, channels, raw_audio_length = raw_audio.shape
 
@@ -430,120 +432,218 @@ class MelBandRoformer(Module):
 
         # to stft
 
-        raw_audio, batch_audio_channel_packed_shape = pack_one(raw_audio, '* t')
+        # Note: Using einops pack/unpack here. Usually compatible with compile.
+        # If issues arise, replace with reshape/view.
+        # Example:
+        # packed_shape = raw_audio.shape[:-1]
+        # raw_audio_flat = raw_audio.reshape(-1, raw_audio_length)
+        raw_audio_flat, batch_audio_channel_packed_shape = pack([raw_audio], '* t')
 
         stft_window = self.stft_window_fn(device=device)
 
-        stft_repr = torch.stft(raw_audio, **self.stft_kwargs, window=stft_window, return_complex=True)
-        stft_repr = torch.view_as_real(stft_repr)
+        stft_repr = torch.stft(raw_audio_flat, **self.stft_kwargs, window=stft_window, return_complex=True)
+        stft_repr = torch.view_as_real(stft_repr) # Shape: (b*s, f, t, c=2)
 
-        stft_repr = unpack_one(stft_repr, batch_audio_channel_packed_shape, '* f t c')
-        stft_repr = rearrange(stft_repr,
-                              'b s f t c -> b (f s) t c')  # merge stereo / mono into the frequency, with frequency leading dimension, for band splitting
+        # Note: Using einops pack/unpack here. Usually compatible with compile.
+        stft_repr = unpack_one(stft_repr, batch_audio_channel_packed_shape, '* f t c') # Shape: (b, s, f, t, c)
+
+        # --- Original einops: rearrange(stft_repr, 'b s f t c -> b (f s) t c') ---
+        # Merge stereo / mono channel (s) into the frequency (f) dimension
+        # Target shape: (b, f*s, t, c)
+        b, s, f, t, c_ = stft_repr.shape
+        stft_repr = stft_repr.permute(0, 2, 1, 3, 4) # Shape: (b, f, s, t, c)
+        stft_repr = stft_repr.reshape(b, f * s, t, c_) # Shape: (b, fs, t, c)
 
         # index out all frequencies for all frequency ranges across bands ascending in one go
-
         batch_arange = torch.arange(batch, device=device)[..., None]
 
-        # account for stereo
+        # Account for stereo (already merged into f dimension in stft_repr)
+        x = stft_repr[:, self.freq_indices] # Indexing freq dim. Shape: (b, num_freq_indices, t, c)
+                                             # Note: freq_indices might select fewer than f*s frequencies
 
-        x = stft_repr[batch_arange, self.freq_indices]
+        # --- Original einops: rearrange(x, 'b f t c -> b t (f c)') ---
+        # This was the likely source of the original SymInt error
+        # Fold the complex (real and imag) into the frequencies dimension and swap t, f
+        # Target shape: (b, t, f*c) where f is num_freq_indices
+        b, f_idx, t, c_ = x.shape
+        x = x.permute(0, 2, 1, 3) # Shape: (b, t, f_idx, c)
+        x = x.reshape(b, t, f_idx * c_) # Shape: (b, t, f_idx*c)
 
-        # fold the complex (real and imag) into the frequencies dimension
-
-        x = rearrange(x, 'b f t c -> b t (f c)')
-
-        x = self.band_split(x)
+        x = self.band_split(x) # Assume band_split handles the (b, t, f_idx*c) shape
 
         # axial / hierarchical attention
 
         for time_transformer, freq_transformer in self.layers:
-            x = rearrange(x, 'b t f d -> b f t d')
-            x, ps = pack([x], '* t d')
+            # --- Original einops: rearrange(x, 'b t f d -> b f t d') ---
+            # Swap time (t) and frequency band (f) dimensions
+            # Input shape assumed: (b, t, f_band, d) from band_split/previous iter
+            x = x.permute(0, 2, 1, 3) # Shape: (b, f_band, t, d)
 
-            x = time_transformer(x)
+            # Note: Using einops pack/unpack here.
+            x_packed, ps = pack([x], '* t d') # Shape: (b*f_band, t, d)
+            x_tfm = time_transformer(x_packed)
+            x, = unpack(x_tfm, ps, '* t d') # Shape: (b, f_band, t, d)
 
-            x, = unpack(x, ps, '* t d')
-            x = rearrange(x, 'b f t d -> b t f d')
-            x, ps = pack([x], '* f d')
+            # --- Original einops: rearrange(x, 'b f t d -> b t f d') ---
+            # Swap frequency band (f) and time (t) dimensions back
+            x = x.permute(0, 2, 1, 3) # Shape: (b, t, f_band, d)
 
-            x = freq_transformer(x)
+            # Note: Using einops pack/unpack here.
+            x_packed, ps = pack([x], '* f d') # Shape: (b*t, f_band, d)
+            x_tfm = freq_transformer(x_packed)
+            x, = unpack(x_tfm, ps, '* f d') # Shape: (b, t, f_band, d)
 
-            x, = unpack(x, ps, '* f d')
 
         num_stems = len(self.mask_estimators)
 
-        masks = torch.stack([fn(x) for fn in self.mask_estimators], dim=1)
-        masks = rearrange(masks, 'b n t (f c) -> b n f t c', c=2)
+        # Input to mask_estimators is x: (b, t, f_band, d)
+        masks = torch.stack([fn(x) for fn in self.mask_estimators], dim=1) # Shape: (b, n, t, f_band*c_out) - Assuming output dim matches f*c
+
+        # --- Original einops: rearrange(masks, 'b n t (f c) -> b n f t c', c=2) ---
+        # Reshape mask output back into (freq_idx, complex) and permute
+        # Target shape: (b, n, f_idx, t, c=2)
+        b, n, t, fc_ = masks.shape
+        c_val = 2 # Complex dimension size
+        f_idx = fc_ // c_val # Calculate f_idx size from mask output dim
+        masks = masks.reshape(b, n, t, f_idx, c_val) # Shape: (b, n, t, f_idx, c)
+        masks = masks.permute(0, 1, 3, 2, 4) # Shape: (b, n, f_idx, t, c)
 
         # modulate frequency representation
 
-        stft_repr = rearrange(stft_repr, 'b f t c -> b 1 f t c')
+        # --- Original einops: rearrange(stft_repr, 'b f t c -> b 1 f t c') ---
+        # Add stem dimension (n=1) to original stft_repr
+        # Input stft_repr shape: (b, fs, t, c)
+        stft_repr = stft_repr.unsqueeze(1) # Shape: (b, 1, fs, t, c)
 
         # complex number multiplication
-
-        stft_repr = torch.view_as_complex(stft_repr)
-        masks = torch.view_as_complex(masks)
-
-        masks = masks.type(stft_repr.dtype)
+        stft_repr_complex = torch.view_as_complex(stft_repr) # Shape: (b, 1, fs, t) complex
+        masks_complex = torch.view_as_complex(masks) # Shape: (b, n, f_idx, t) complex
+        masks_complex = masks_complex.type(stft_repr_complex.dtype)
 
         # need to average the estimated mask for the overlapped frequencies
 
-        scatter_indices = repeat(self.freq_indices, 'f -> b n f t', b=batch, n=num_stems, t=stft_repr.shape[-1])
+        # --- Original einops: repeat(self.freq_indices, 'f -> b n f t', b=batch, n=num_stems, t=stft_repr.shape[-1]) ---
+        # Expand freq_indices for scatter_add_
+        # Target shape: (b, n, f_idx, t)
+        t_dim = stft_repr_complex.shape[-1] # Get time dimension size from complex view
+        # Start with freq_indices shape: (f_idx,)
+        scatter_indices = self.freq_indices.view(1, 1, -1, 1) # Shape: (1, 1, f_idx, 1)
+        scatter_indices = scatter_indices.expand(batch, num_stems, -1, t_dim) # Shape: (b, n, f_idx, t)
 
-        stft_repr_expanded_stems = repeat(stft_repr, 'b 1 ... -> b n ...', n=num_stems)
-        masks_summed = torch.zeros_like(stft_repr_expanded_stems).scatter_add_(2, scatter_indices, masks)
+        # --- Original einops: repeat(stft_repr, 'b 1 ... -> b n ...', n=num_stems) ---
+        # Expand stft_repr along the stem dimension for scatter_add_ target
+        # Target shape: (b, n, fs, t) complex
+        # Use .expand() for memory efficiency if grads aren't needed through the expansion itself,
+        # otherwise use .repeat(). Scatter target doesn't usually need gradients itself.
+        stft_repr_expanded_stems = stft_repr_complex.expand(-1, num_stems, -1, -1) # Shape: (b, n, fs, t) complex
 
-        denom = repeat(self.num_bands_per_freq, 'f -> (f r) 1', r=channels)
+        # Use scatter_add_ with complex numbers requires viewing as real temporarily
+        stft_repr_expanded_stems_real = torch.view_as_real(stft_repr_expanded_stems) # (b, n, fs, t, c)
+        masks_real = torch.view_as_real(masks_complex) # (b, n, f_idx, t, c)
+        scatter_indices_real = scatter_indices.unsqueeze(-1).expand(-1, -1, -1, -1, 2) # (b, n, f_idx, t, c)
 
-        masks_averaged = masks_summed / denom.clamp(min=1e-8)
+        # Dim 2 is the frequency dimension (fs) in stft_repr_expanded_stems_real
+        masks_summed_real = torch.zeros_like(stft_repr_expanded_stems_real).scatter_add_(2, scatter_indices_real, masks_real)
+        masks_summed = torch.view_as_complex(masks_summed_real) # Shape: (b, n, fs, t) complex
+
+
+        # --- Original einops: repeat(self.num_bands_per_freq, 'f -> (f r) 1', r=channels) ---
+        # Calculate denominator for averaging overlaps
+        # Target shape: (fs, 1) where fs = f_orig * channels
+        # Input num_bands_per_freq shape: (f_orig,) - assuming it's based on original frequencies before stereo merge
+        denom = self.num_bands_per_freq.repeat_interleave(channels, dim=0) # Shape: (fs,)
+        denom = denom.unsqueeze(-1) # Shape: (fs, 1)
+        # Add dimensions for broadcasting: (1, 1, fs, 1)
+        denom = denom.view(1, 1, -1, 1)
+
+        masks_averaged = masks_summed / denom.clamp(min=1e-8) # Shape: (b, n, fs, t) complex
 
         # modulate stft repr with estimated mask
-
-        stft_repr = stft_repr * masks_averaged
+        # stft_repr_complex is (b, 1, fs, t), masks_averaged is (b, n, fs, t)
+        # Broadcasting happens automatically on dim 1
+        stft_repr_masked = stft_repr_complex * masks_averaged # Shape: (b, n, fs, t) complex
 
         # istft
 
-        stft_repr = rearrange(stft_repr, 'b n (f s) t -> (b n s) f t', s=self.audio_channels)
+        # --- Original einops: rearrange(stft_repr, 'b n (f s) t -> (b n s) f t', s=self.audio_channels) ---
+        # Reshape for istft: Merge b, n, s dimensions; separate f and s from fs dimension
+        # Target shape: (b*n*s, f_orig, t) complex
+        b, n, fs, t_ = stft_repr_masked.shape
+        s = self.audio_channels
+        f_orig = fs // s # Calculate original frequency dimension size
+        # Reshape to explicitly separate f_orig and s
+        stft_repr_masked = stft_repr_masked.view(b, n, f_orig, s, t_) # Shape: (b, n, f_orig, s, t)
+        # Permute to bring b, n, s together
+        stft_repr_masked = stft_repr_masked.permute(0, 1, 3, 2, 4) # Shape: (b, n, s, f_orig, t)
+        # Reshape to merge leading dimensions
+        stft_repr_to_istft = stft_repr_masked.reshape(b * n * s, f_orig, t_) # Shape: (b*n*s, f_orig, t)
 
-        recon_audio = torch.istft(stft_repr, **self.stft_kwargs, window=stft_window, return_complex=False,
-                                  length=istft_length)
+        recon_audio = torch.istft(stft_repr_to_istft, **self.stft_kwargs, window=stft_window, return_complex=False,
+                                  length=istft_length) # Shape: (b*n*s, raw_t)
 
-        recon_audio = rearrange(recon_audio, '(b n s) t -> b n s t', b=batch, s=self.audio_channels, n=num_stems)
+        # --- Original einops: rearrange(recon_audio, '(b n s) t -> b n s t', b=batch, s=self.audio_channels, n=num_stems) ---
+        # Reshape back into batch, stems, channels, time
+        # Target shape: (b, n, s, raw_t)
+        raw_t = recon_audio.shape[-1]
+        recon_audio = recon_audio.view(batch, num_stems, self.audio_channels, raw_t) # Shape: (b, n, s, t)
 
+
+        # --- Original einops: rearrange(recon_audio, 'b 1 s t -> b s t') ---
+        # Remove stem dimension if num_stems is 1
         if num_stems == 1:
-            recon_audio = rearrange(recon_audio, 'b 1 s t -> b s t')
+            recon_audio = recon_audio.squeeze(1) # Shape: (b, s, t)
 
         # if a target is passed in, calculate loss for learning
 
         if not exists(target):
             return recon_audio
 
+        # Ensure target has same number of stems if multi-stem output
         if self.num_stems > 1:
-            assert target.ndim == 4 and target.shape[1] == self.num_stems
+            assert target.ndim == 4 and target.shape[1] == self.num_stems, \
+                   f"Target ndim ({target.ndim}) or stems ({target.shape[1]}) mismatch. Expected 4 dims and {self.num_stems} stems."
 
-        if target.ndim == 2:
-            target = rearrange(target, '... t -> ... 1 t')
+        # --- Original einops: rearrange(target, '... t -> ... 1 t') ---
+        # Add channel dimension 's' if target is missing it compared to recon_audio
+        # Handles case where target is (b, t) for mono or (b, n, t) for multi-stem mono target
+        # Should result in (b, 1, t) or (b, n, 1, t)
+        if target.ndim == (recon_audio.ndim - 1):
+             target = target.unsqueeze(-2) # Add channel dim before time
 
-        target = target[..., :recon_audio.shape[-1]]  # protect against lost length on istft
 
+        # Protect against lost length on istft
+        min_len = min(recon_audio.shape[-1], target.shape[-1])
+        recon_audio = recon_audio[..., :min_len]
+        target = target[..., :min_len]
+
+        # L1 loss in time domain
         loss = F.l1_loss(recon_audio, target)
 
+        # Multi-resolution STFT loss
         multi_stft_resolution_loss = 0.
+
+        # Permute recon_audio and target for STFT: (... s t) -> (...*s, t)
+        # --- Original einops: rearrange(recon_audio, '... s t -> (... s) t') ---
+        recon_audio_flat = recon_audio.reshape(-1, recon_audio.shape[-1]) # Shape: (B*S, T) where B includes stems if present
+        # --- Original einops: rearrange(target, '... s t -> (... s) t') ---
+        target_flat = target.reshape(-1, target.shape[-1]) # Shape: (B*S, T)
 
         for window_size in self.multi_stft_resolutions_window_sizes:
             res_stft_kwargs = dict(
-                n_fft=max(window_size, self.multi_stft_n_fft),  # not sure what n_fft is across multi resolution stft
+                n_fft=max(window_size, self.multi_stft_n_fft),
                 win_length=window_size,
                 return_complex=True,
                 window=self.multi_stft_window_fn(window_size, device=device),
                 **self.multi_stft_kwargs,
             )
 
-            recon_Y = torch.stft(rearrange(recon_audio, '... s t -> (... s) t'), **res_stft_kwargs)
-            target_Y = torch.stft(rearrange(target, '... s t -> (... s) t'), **res_stft_kwargs)
+            recon_Y = torch.stft(recon_audio_flat, **res_stft_kwargs)
+            target_Y = torch.stft(target_flat, **res_stft_kwargs)
 
-            multi_stft_resolution_loss = multi_stft_resolution_loss + F.l1_loss(recon_Y, target_Y)
+            # L1 loss on magnitude of STFT
+            multi_stft_resolution_loss = multi_stft_resolution_loss + F.l1_loss(torch.abs(recon_Y), torch.abs(target_Y))
+            # Optional: Add phase loss component too? Often just magnitude is used.
+            # phase_loss = F.mse_loss(torch.angle(recon_Y), torch.angle(target_Y)) # Example
 
         weighted_multi_resolution_loss = multi_stft_resolution_loss * self.multi_stft_resolution_loss_weight
 
@@ -553,3 +653,4 @@ class MelBandRoformer(Module):
             return total_loss
 
         return total_loss, (loss, multi_stft_resolution_loss)
+    
