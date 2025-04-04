@@ -75,8 +75,9 @@ def run_folder(model, args, config, device, verbose=False):
         instrumental_path = "{}/{}_instrumental.wav".format(args.store_dir, os.path.basename(path)[:-4])
         sf.write(instrumental_path, instrumental, sr, subtype='FLOAT')
 
-    time.sleep(1)
+    
     print("Elapsed time: {:.2f} sec".format(time.time() - start_time))
+    time.sleep(1)
 
 
 def proc_folder(args):
