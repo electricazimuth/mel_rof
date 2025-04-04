@@ -108,8 +108,8 @@ class RotaryEmbeddingCompileSafeWrapper(nn.Module):
         if should_cache and cache_key in original_cache:
             # Clone tensor retrieved from cache. The cached version should
             # already be the final, repeated form based on original logic.
-            freqs_final = original_cache[cache_key].clone()
-            return freqs_final
+            freqs_final_from_cache = original_cache[cache_key].clone()
+            return freqs_final_from_cache
 
         # --- Compute freqs if not cached ---
         if callable(t_lambda):
@@ -125,17 +125,19 @@ class RotaryEmbeddingCompileSafeWrapper(nn.Module):
         # --- CRITICAL FIX: Clone *before* repeat_interleave ---
         # This ensures the tensor entering repeat_interleave is distinct
         # within the context of the graph capture.
-        freqs_to_repeat = freqs_computed.clone()
+        # Apply repeat_interleave
+        # We already tried cloning before this, didn't help. Let's try without it here.
+        freqs_final_computed = freqs_computed.repeat_interleave(2, dim=-1)
 
         # Apply repeat_interleave using the cloned tensor
-        freqs_final = freqs_to_repeat.repeat_interleave(2, dim=-1)
+        freqs_to_cache_and_return = freqs_final_computed.clone()
 
         # Cache the computed *and repeated* freqs
         if should_cache:
             # Store a clone to be absolutely safe
-            original_cache[cache_key] = freqs_final.clone()
+            original_cache[cache_key] = freqs_to_cache_and_return
 
-        return freqs_final
+        return freqs_to_cache_and_return
 
     def rotate_queries_or_keys(self, t, seq_dim = None, offset = 0, freq_seq_len = None):
         """
