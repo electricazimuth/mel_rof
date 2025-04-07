@@ -1,0 +1,38 @@
+build:
+  # Use GPU for acceleration
+  gpu: true
+  python_version: "3.10" 
+
+  # Install required system packages
+  system_packages:
+    - "libsndfile1" # Required by soundfile
+    - "ffmpeg"
+
+  # Install required Python packages
+  # Pin versions for reproducibility
+  python_packages:
+    - "torch==2.1.2" # Pin torch version
+    - "torchaudio==2.1.2" # Often needed with torch audio processing
+    - "torchvision==0.16.2" # Often needed with torch
+    - "numpy<2"
+    - "pandas"
+    - "soundfile"
+    - "ml_collections"
+    - "tqdm"
+    - "segmentation_models_pytorch==0.3.3"
+    - "timm==0.9.2"
+    - "omegaconf==2.2.3"
+    - "PyYAML" # Needed for loading the config
+    - "beartype==0.14.1"
+    - "rotary_embedding_torch==0.3.5"
+    - "einops==0.6.1"
+    - "librosa"
+
+  # Optional: Specify CUDA version if needed, otherwise Cog tries to infer
+  cuda: "11.8"
+
+# Define the entry point for predictions
+predict: "predict.py:Predictor"
+
+# Optional: Define the image name for easier pushing/management
+# image: "your-dockerhub-username/mel-band-roformer"

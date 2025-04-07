@@ -26,7 +26,8 @@ def get_windowing_array(window_size, fade_size, device):
     window[:fade_size] *= fadein
     return window.to(device)
 
-def demix_track(config, model, mix, device, first_chunk_time=None):
+# --- MODIFIED demix_track function ---
+def demix_track(config, model, mix, device, runtime_batch_size: int, first_chunk_time=None):
     """
     Separates audio sources using overlapping chunks and batch processing.
 
@@ -36,6 +37,7 @@ def demix_track(config, model, mix, device, first_chunk_time=None):
         model: The PyTorch model for separation.
         mix: The input audio mixture tensor (channels, time).
         device: The device to run inference on (e.g., 'cuda:0', 'cpu').
+        runtime_batch_size: The batch size to use for this specific run. # <-- New argument
         first_chunk_time: Optional timing information from previous runs.
 
     Returns:
@@ -46,9 +48,17 @@ def demix_track(config, model, mix, device, first_chunk_time=None):
     # --- Configuration Reading ---
     C = config.inference.chunk_size
     N = config.inference.num_overlap
-    # --- NEW: Get batch_size from config, default to 1 if not present ---
-    batch_size = getattr(config.inference, 'batch_size', 1)
-    print(f"Using batch size: {batch_size}") # Optional: Inform user
+    # --- USE the runtime batch size passed as an argument ---
+    batch_size = runtime_batch_size # Use the argument directly
+    # Ensure batch_size is at least 1 (should be handled by Cog Input, but double-check)
+    if batch_size < 1:
+        print(f"Warning: Received invalid batch_size ({batch_size}). Setting to 1.")
+        batch_size = 1
+    # print(f"Using runtime batch size: {batch_size}") # Already printed in predict.py
+
+    # --- Remove or comment out the old config reading for batch_size ---
+    # batch_size_config = getattr(config.inference, 'batch_size', 1)
+    # print(f"Using config batch size: {batch_size_config}") # Old print
 
     step = C // N
     fade_size = C // 10
@@ -58,7 +68,7 @@ def demix_track(config, model, mix, device, first_chunk_time=None):
     # --- Padding ---
     # Ensure mix is a tensor and on the correct device early
     if not isinstance(mix, torch.Tensor):
-         mix = torch.tensor(mix, dtype=torch.float32)
+        mix = torch.tensor(mix, dtype=torch.float32)
     mix = mix.to(device)
 
     if total_length > 2 * border and border > 0:
@@ -107,9 +117,9 @@ def demix_track(config, model, mix, device, first_chunk_time=None):
                     pad_length = C - current_length
                     # Choose padding mode based on length (consistent with original potentially)
                     if current_length > C // 2 + 1: # Heuristic from original
-                         part = nn.functional.pad(input=part, pad=(0, pad_length), mode='reflect')
+                        part = nn.functional.pad(input=part, pad=(0, pad_length), mode='reflect')
                     else:
-                         part = nn.functional.pad(input=part, pad=(0, pad_length, 0, 0), mode='constant', value=0)
+                        part = nn.functional.pad(input=part, pad=(0, pad_length, 0, 0), mode='constant', value=0)
 
 
                 # --- Add to Batch ---
@@ -122,7 +132,7 @@ def demix_track(config, model, mix, device, first_chunk_time=None):
 
                     # --- First Chunk Timing ---
                     if not first_chunk_processed_flag:
-                         chunk_start_time = time.time()
+                        chunk_start_time = time.time()
 
                     # --- Stack and Model Forward ---
                     batch_tensor = torch.stack(batch_data, dim=0)
@@ -135,11 +145,11 @@ def demix_track(config, model, mix, device, first_chunk_time=None):
 
                      # --- First Chunk Timing ---
                     if not first_chunk_processed_flag:
-                         chunk_time = time.time() - chunk_start_time
-                         first_chunk_time = chunk_time # Store time for the first *batch*
-                         estimated_total_time = chunk_time * (num_chunks / batch_size) # Rough estimate
-                         print(f"First batch processed in {chunk_time:.2f}s. Estimated total: {estimated_total_time:.2f}s")
-                         first_chunk_processed_flag = True
+                        chunk_time = time.time() - chunk_start_time
+                        first_chunk_time = chunk_time # Store time for the first *batch*
+                        estimated_total_time = chunk_time * (num_chunks / batch_size) # Rough estimate
+                        print(f"First batch processed in {chunk_time:.2f}s. Estimated total: {estimated_total_time:.2f}s  (batch size: {batch_size})")
+                        first_chunk_processed_flag = True
 
                     # --- Process Batch Results ---
                     for j in range(len(batch_data)): # Iterate through results in the batch
@@ -186,7 +196,7 @@ def demix_track(config, model, mix, device, first_chunk_time=None):
                     batches_total = num_chunks / batch_size
                     time_remaining = first_chunk_time * (batches_total - batches_processed)
                     if time_remaining < 0: time_remaining = 0 # Prevent negative estimates
-                    sys.stdout.write(f"\rEstimated time remaining: {time_remaining:.2f} seconds ({chunks_processed}/{num_chunks} chunks)")
+                    sys.stdout.write(f"\rEstimated time remaining: {time_remaining:.2f} seconds ({chunks_processed}/{num_chunks} chunks) @ batch size {batch_size}")
                     sys.stdout.flush()
 
 
