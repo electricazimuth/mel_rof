@@ -6,6 +6,7 @@ build:
   # Install required system packages
   system_packages:
     - "libsndfile1" # Required by soundfile
+    - "libmp3lame0"
     - "ffmpeg"
 
   # Install required Python packages
@@ -15,6 +16,7 @@ build:
     - "torchaudio==2.1.2" # Often needed with torch audio processing
     - "torchvision==0.16.2" # Often needed with torch
     - "numpy<2"
+    - "lameenc"
     - "pandas"
     - "soundfile"
     - "ml_collections"
